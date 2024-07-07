@@ -1,0 +1,127 @@
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv, SAGEConv
+from sklearn.preprocessing import LabelEncoder, StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from imblearn.over_sampling import SMOTE
+
+# 读取数据
+df1 = pd.read_csv(r'F:\pythonProject1\.venv\Scripts\merged_data.csv')
+df2 = pd.read_csv(r'F:\validationSet_res.csv')
+df1.drop(['start_time', 'end_time', 'open_datetime', 'update_time', 'date', 'date_c'], axis=1, inplace=True)
+df2.drop(['start_time', 'end_time', 'open_datetime', 'update_time', 'date', 'date_c'], axis=1, inplace=True)
+
+# 编码msisdn和other_party
+le_msisdn = LabelEncoder()
+le_other_party = LabelEncoder()
+
+df1['msisdn_encoded'] = le_msisdn.fit_transform(df1['msisdn'])
+df1['other_party_encoded'] = le_other_party.fit_transform(df1['other_party']) + len(le_msisdn.classes_)
+df2['msisdn_encoded'] = le_msisdn.fit_transform(df2['msisdn'])
+df2['other_party_encoded'] = le_other_party.fit_transform(df2['other_party']) + len(le_msisdn.classes_)
+
+# 定义数值和类别特征
+numeric_features = ['call_duration', 'cfee', 'lfee', 'hour']
+categorical_features = ['call_event', 'a_serv_type', 'long_type1', 'roam_type', 'a_product_id', 'dayofweek',
+                        'phone1_type', 'phone2_type', 'phone1_loc_province', 'phone2_loc_province']
+
+# 目标编码类别特征
+for feature in categorical_features:
+    le = LabelEncoder()
+    df1[feature] = le.fit_transform(df1[feature])
+    df2[feature] = le.fit_transform(df2[feature])
+
+# 标准化数值特征
+scaler = StandardScaler()
+df1[numeric_features] = scaler.fit_transform(df1[numeric_features])
+df2[numeric_features] = scaler.transform(df2[numeric_features])
+
+X = df1[numeric_features + categorical_features].values
+X2 = df2[numeric_features + categorical_features].values
+y = df1['is_sa'].values
+
+# 构建边列表
+edges = []
+edges2 = []
+for index, row in df1.iterrows():
+    msisdn_node = row['msisdn_encoded']
+    other_party_node = row['other_party_encoded']
+    edges.append([msisdn_node, other_party_node])
+for index, row in df2.iterrows():
+    msisdn_node = row['msisdn_encoded']
+    other_party_node = row['other_party_encoded']
+    edges2.append([msisdn_node, other_party_node])
+
+# 边：msisdn和other_party之间的连接
+edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+edge_index2 = torch.tensor(edges2, dtype=torch.long).t().contiguous()
+
+x = torch.tensor(X, dtype=torch.float)
+x2 = torch.tensor(X2, dtype=torch.float)
+
+# 将标签转换为torch tensor
+y = torch.tensor(y, dtype=torch.long)
+
+# 使用SMOTE进行过采样
+smote = SMOTE(random_state=42)
+X_resampled, y_resampled = smote.fit_resample(X, y)
+data = Data(x=torch.tensor(X_resampled, dtype=torch.float), edge_index=edge_index, y=torch.tensor(y_resampled, dtype=torch.long))
+
+# 划分训练集和测试集
+train_mask = range(len(y_resampled))  # 使用过采样后的标签
+
+# 定义GraphSAGE模型
+class GraphSAGE(torch.nn.Module):
+    def __init__(self, num_features, num_classes):
+        super(GraphSAGE, self).__init__()
+        self.conv1 = SAGEConv(num_features, 16)
+        self.conv2 = SAGEConv(16, num_classes)
+        self.dropout = torch.nn.Dropout(p=0.5)  # 增加Dropout层
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = self.dropout(x)  # 应用Dropout
+        x = self.conv2(x, edge_index)
+        return F.log_softmax(x, dim=1)
+
+# 初始化模型
+model = GraphSAGE(num_features=x.size(1), num_classes=2)  # 使用GraphSAGE模型
+optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)  # 调整学习率和添加权重衰减
+weights = torch.tensor([1.0, 2.0])
+criterion = torch.nn.CrossEntropyLoss()  # 使用加权交叉熵损失函数
+
+# 训练模型
+model.train()
+for epoch in range(100):  # 减少训练轮次
+    optimizer.zero_grad()
+    out = model(data)
+    loss = criterion(out[train_mask], data.y[train_mask])
+    loss.backward()
+    optimizer.step()
+
+# 预测
+data2 = Data(x=x2, edge_index=edge_index2)
+model.eval()
+with torch.no_grad():
+    out = model(data2)
+    pred = out.argmax(dim=1)
+
+# 使用模型对df2进行预测
+pred_y2 = pred.numpy()
+pred_series = pd.Series(pred_y2, name='is_sa')
+
+# 创建一个新的DataFrame来存储msisdn列和预测结果
+results_df = pd.DataFrame({
+    'msisdn': df2['msisdn'],
+    'is_sa': pred_series
+})
+
+# 保存预测结果到CSV文件
+results_df = results_df.groupby('msisdn').agg({'is_sa': 'max'}).reset_index()
+results_df.to_csv('F:/pythonProject1/.venv/Scripts/results.csv', index=False)
+
